@@ -8,7 +8,7 @@ valence_schema! {
     ValenceIterRowError {
         repository: "https://github.com/unified-field-dev/valence-platform",
         table: "valence_iter_row_error",
-        version: "0.1.0",
+        version: "0.2.0",
         database: crate::DEFAULT_PLATFORM_STORAGE,
         description: "Error record for a single row that failed during iter execution",
 
@@ -68,6 +68,14 @@ valence_schema! {
             error_kind: {
                 r#type: FieldType::Enum(&["should_run_error", "execute_error"]),
                 required: true,
+            },
+            field: {
+                r#type: FieldType::String,
+                required: false,
+            },
+            rule: {
+                r#type: FieldType::String,
+                required: false,
             },
             created_at: {
                 r#type: FieldType::DateTime,

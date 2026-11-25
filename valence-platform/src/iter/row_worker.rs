@@ -143,6 +143,117 @@ async fn maybe_complete_batch(batch_id: &str, valence: &Valence) -> anyhow::Resu
     Ok(())
 }
 
+/// Longest row error message saved, in characters.
+const ROW_ERROR_MESSAGE_MAX_CHARS: usize = 200;
+
+/// Field values shorter than this aren't removed from saved error text; stripping every
+/// `1` or `a` would leave the message unreadable.
+const MIN_REDACTED_VALUE_CHARS: usize = 2;
+
+/// `<stage>:<kind>` for a row error's `rule`, such as `execute:validation`.
+fn error_rule(stage: &str, error: &valence::Error) -> String {
+    let kind = match error {
+        valence::Error::Database { .. } => "database",
+        valence::Error::NotFound(_) => "not_found",
+        valence::Error::Validation(_) => "validation",
+        valence::Error::Privacy(_) => "privacy",
+        valence::Error::Internal(_) => "internal",
+        valence::Error::Serialization { .. } => "serialization",
+        valence::Error::PendingDeletion(_) => "pending_deletion",
+        valence::Error::Identity(_) => "identity",
+    };
+    format!("{stage}:{kind}")
+}
+
+/// Every string and number stored in `value`, as text.
+fn collect_stored_values(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(s) => out.push(s.clone()),
+        serde_json::Value::Number(n) => out.push(n.to_string()),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_stored_values(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values() {
+                collect_stored_values(item, out);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) => {}
+    }
+}
+
+/// Whether `word` appears in `text` with no letter, digit or `_` on either side.
+fn contains_word(text: &str, word: &str) -> bool {
+    let is_word_char = |c: char| c.is_alphanumeric() || c == '_';
+    text.match_indices(word).any(|(i, _)| {
+        let before = text[..i].chars().next_back();
+        let after = text[i + word.len()..].chars().next();
+        !before.is_some_and(is_word_char) && !after.is_some_and(is_word_char)
+    })
+}
+
+/// Make a row error safe to store: every substring equal to one of the row's stored
+/// values becomes `…`, and the result is cut to 200 characters. Also returns the first of
+/// the row's field names the message mentions, if any.
+fn redact_row_error(message: &str, row: Option<&serde_json::Value>) -> (String, Option<String>) {
+    let mut redacted = message.to_string();
+    let field = row.and_then(|row| {
+        let mut values = Vec::new();
+        collect_stored_values(row, &mut values);
+        values.retain(|v| v.chars().count() >= MIN_REDACTED_VALUE_CHARS);
+        // Longest first, so a value that contains a shorter one goes whole.
+        values.sort_by_key(|v| std::cmp::Reverse(v.len()));
+        values.dedup();
+        for value in &values {
+            redacted = redacted.replace(value.as_str(), "…");
+        }
+        row.as_object().and_then(|map| {
+            map.keys()
+                .filter(|k| k.as_str() != "id")
+                .find(|k| contains_word(&redacted, k))
+                .cloned()
+        })
+    });
+    let capped = redacted.chars().take(ROW_ERROR_MESSAGE_MAX_CHARS).collect();
+    (capped, field)
+}
+
+/// One failed row, as [`save_row_failure`] records it.
+struct RowFailure<'a> {
+    run_id: &'a str,
+    batch_id: &'a str,
+    row_id: &'a str,
+    kind: ValenceIterRowErrorErrorKind,
+    rule: String,
+    message: &'a str,
+    row: Option<&'a serde_json::Value>,
+}
+
+/// Save a [`ValenceIterRowError`] with record values removed from its message, then count
+/// the row as failed on its run and batch.
+async fn save_row_failure(valence: &Valence, failure: RowFailure<'_>) -> anyhow::Result<()> {
+    let (message, field) = redact_row_error(failure.message, failure.row);
+    let err = ValenceIterRowError::new(
+        failure.run_id.to_string(),
+        Some(failure.batch_id.to_string()),
+        failure.row_id.to_string(),
+        message,
+        failure.kind,
+        field,
+        Some(failure.rule),
+        Utc::now(),
+    )
+    .map_err(|e| anyhow!("{}", e))?;
+    ValenceIterRowError::create(err, valence, valence::use_!(r"When **Valence platform iter and deletion** needs to persist work, we **save Valence Iter Row Error** so the next step in that feature can continue with the latest values. People and services allowed for **Valence platform iter and deletion** use this data for that workflow—not as a general export of unrelated personal fields."))
+        .await
+        .map_err(|e| anyhow!("{}", e))?;
+    bump_run_field(failure.run_id, "failed_rows", 1, valence).await?;
+    bump_batch_field(failure.batch_id, "failed", 1, valence).await?;
+    maybe_complete_batch(failure.batch_id, valence).await
+}
+
 /// Directly run row-worker logic (same as the Boson task body). Use this in tests; the
 /// `#[boson::task]` entrypoint is renamed to `__valence_iter_row_worker_impl` by the macro.
 pub async fn run_valence_iter_row_worker(
@@ -179,21 +290,19 @@ pub async fn run_valence_iter_row_worker(
     let row_json = match load_row_json(&valence, &table_name, &row_id).await {
         Ok(j) => inject_row_id_if_missing(&table_name, &row_id, j),
         Err(e) => {
-            let err = ValenceIterRowError::new(
-                run_id.clone(),
-                Some(batch_id.clone()),
-                row_id.clone(),
-                e.to_string(),
-                ValenceIterRowErrorErrorKind::ShouldRunError,
-                Utc::now(),
+            save_row_failure(
+                &valence,
+                RowFailure {
+                    run_id: &run_id,
+                    batch_id: &batch_id,
+                    row_id: &row_id,
+                    kind: ValenceIterRowErrorErrorKind::ShouldRunError,
+                    rule: "load_row".to_string(),
+                    message: &e.to_string(),
+                    row: None,
+                },
             )
-            .map_err(|e2| anyhow!("{}", e2))?;
-            ValenceIterRowError::create(err, &valence, valence::use_!(r"When **Valence platform iter and deletion** needs to persist work, we **save Valence Iter Row Error** so the next step in that feature can continue with the latest values. People and services allowed for **Valence platform iter and deletion** use this data for that workflow—not as a general export of unrelated personal fields."))
-                .await
-                .map_err(|e2| anyhow!("{}", e2))?;
-            bump_run_field(&run_id, "failed_rows", 1, &valence).await?;
-            bump_batch_field(&batch_id, "failed", 1, &valence).await?;
-            maybe_complete_batch(&batch_id, &valence).await?;
+            .await?;
             return Ok(());
         }
     };
@@ -201,21 +310,19 @@ pub async fn run_valence_iter_row_worker(
     let eval = match (desc.should_run)(valence.clone(), row_json.clone()).await {
         Ok(e) => e,
         Err(e) => {
-            let err = ValenceIterRowError::new(
-                run_id.clone(),
-                Some(batch_id.clone()),
-                row_id.clone(),
-                e.to_string(),
-                ValenceIterRowErrorErrorKind::ShouldRunError,
-                Utc::now(),
+            save_row_failure(
+                &valence,
+                RowFailure {
+                    run_id: &run_id,
+                    batch_id: &batch_id,
+                    row_id: &row_id,
+                    kind: ValenceIterRowErrorErrorKind::ShouldRunError,
+                    rule: error_rule("should_run", &e),
+                    message: &e.to_string(),
+                    row: Some(&row_json),
+                },
             )
-            .map_err(|e2| anyhow!("{}", e2))?;
-            ValenceIterRowError::create(err, &valence, valence::use_!(r"When **Valence platform iter and deletion** needs to persist work, we **save Valence Iter Row Error** so the next step in that feature can continue with the latest values. People and services allowed for **Valence platform iter and deletion** use this data for that workflow—not as a general export of unrelated personal fields."))
-                .await
-                .map_err(|e2| anyhow!("{}", e2))?;
-            bump_run_field(&run_id, "failed_rows", 1, &valence).await?;
-            bump_batch_field(&batch_id, "failed", 1, &valence).await?;
-            maybe_complete_batch(&batch_id, &valence).await?;
+            .await?;
             return Ok(());
         }
     };
@@ -227,22 +334,20 @@ pub async fn run_valence_iter_row_worker(
         return Ok(());
     }
 
-    if let Err(e) = (desc.execute)(valence.clone(), row_json).await {
-        let err = ValenceIterRowError::new(
-            run_id.clone(),
-            Some(batch_id.clone()),
-            row_id.clone(),
-            e.to_string(),
-            ValenceIterRowErrorErrorKind::ExecuteError,
-            Utc::now(),
+    if let Err(e) = (desc.execute)(valence.clone(), row_json.clone()).await {
+        save_row_failure(
+            &valence,
+            RowFailure {
+                run_id: &run_id,
+                batch_id: &batch_id,
+                row_id: &row_id,
+                kind: ValenceIterRowErrorErrorKind::ExecuteError,
+                rule: error_rule("execute", &e),
+                message: &e.to_string(),
+                row: Some(&row_json),
+            },
         )
-        .map_err(|e2| anyhow!("{}", e2))?;
-        ValenceIterRowError::create(err, &valence, valence::use_!(r"When **Valence platform iter and deletion** needs to persist work, we **save Valence Iter Row Error** so the next step in that feature can continue with the latest values. People and services allowed for **Valence platform iter and deletion** use this data for that workflow—not as a general export of unrelated personal fields."))
-            .await
-            .map_err(|e2| anyhow!("{}", e2))?;
-        bump_run_field(&run_id, "failed_rows", 1, &valence).await?;
-        bump_batch_field(&batch_id, "failed", 1, &valence).await?;
-        maybe_complete_batch(&batch_id, &valence).await?;
+        .await?;
         return Ok(());
     }
 
@@ -274,4 +379,54 @@ pub async fn valence_iter_row_worker(
 ) -> anyhow::Result<()> {
     let valence = boson_valence_identity::valence_from_context(ctx.as_ref())?;
     run_valence_iter_row_worker(valence, run_id, batch_id, row_id, iter_name, table_name).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn worker_error_quoting_the_title_is_saved_without_it() {
+        let row = json!({
+            "id": "doc:d1",
+            "title": "Quarterly payroll for Dana Whitfield",
+            "pages": 12,
+            "archived": false,
+        });
+        let error = valence::Error::Validation(
+            "title \"Quarterly payroll for Dana Whitfield\" exceeds 20 characters".to_string(),
+        );
+        let (message, field) = redact_row_error(&error.to_string(), Some(&row));
+        assert!(!message.contains("Dana"), "{message}");
+        assert_eq!(
+            message,
+            "Validation error: title \"…\" exceeds 20 characters"
+        );
+        assert_eq!(field.as_deref(), Some("title"));
+        assert_eq!(error_rule("execute", &error), "execute:validation");
+    }
+
+    #[test]
+    fn numbers_are_removed_and_short_values_kept() {
+        let row = json!({"id": "doc:d2", "pages": 1234, "grade": "B"});
+        let (message, field) = redact_row_error("pages 1234 over limit, rated B", Some(&row));
+        assert_eq!(message, "pages … over limit, rated B");
+        assert_eq!(field.as_deref(), Some("pages"));
+    }
+
+    #[test]
+    fn message_is_capped_at_200_characters() {
+        let long = "é".repeat(500);
+        let (message, field) = redact_row_error(&long, None);
+        assert_eq!(message.chars().count(), ROW_ERROR_MESSAGE_MAX_CHARS);
+        assert_eq!(field, None);
+    }
+
+    #[test]
+    fn field_names_match_whole_words_only() {
+        let row = json!({"id": "doc:d3", "page": "p"});
+        let (_, field) = redact_row_error("pages are missing", Some(&row));
+        assert_eq!(field, None);
+    }
 }
