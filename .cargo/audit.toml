@@ -1,4 +1,8 @@
 [advisories]
 # Transitive via broker SDKs; no fixed upgrade available upstream (matches the
 # same ignore already used in higgs/deny.toml elsewhere in the fleet).
-ignore = ["RUSTSEC-2023-0071"]
+ignore = ["RUSTSEC-2023-0071",
+    # sqlx 0.8 pins libsqlite3-sys 0.30; tracked in Magnon cda5c9a9
+    "RUSTSEC-2026-0459",
+    # chrono / chrono-tz unmaintained, no safe upgrade; tracked in Magnon 36ffaefb
+    "RUSTSEC-2026-0543", "RUSTSEC-2026-0555"]

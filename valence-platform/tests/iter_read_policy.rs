@@ -98,6 +98,8 @@ async fn seed_iter_rows(system: &Valence) {
         "w1".into(),
         "fixture failure".into(),
         ValenceIterRowErrorErrorKind::ExecuteError,
+        None,
+        Some("execute:internal".into()),
         Utc::now(),
     )
     .expect("row error row");
